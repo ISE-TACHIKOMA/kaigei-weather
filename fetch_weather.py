@@ -7,6 +7,11 @@
 #   タイル0: R=気圧 950〜1050 hPa   G=気温 -20〜40 ℃      B=雲量 0〜100 %
 #   タイル1: R=風 東向き -40〜40 m/s G=風 北向き -40〜40   B=波高 0〜15 m
 #   タイル2: R=海流 東向き -2〜2 m/s G=海流 北向き -2〜2  B=陸 (255) / 海 (0)
+#   タイル3: R=現在の降水量 sqrt(0〜30 mm/h)
+#   タイル4〜10: 1週間予報 (今日 = タイル4)
+#     下段 (画像の下半分): R=最高気温 -20〜40 ℃  G=最低気温 -20〜40 ℃  B=降水量 sqrt(0〜200 mm/日)
+#     上段 (画像の上半分): R=天気コード (WMO, そのまま 0〜99)  G=最大風速 0〜40 m/s
+#   画像は幅 11N, 高さ 2N。下半分の左 3 タイルは以前と同じ形式 (古いワールドも読める)
 import json, math, os, sys, time, urllib.request
 from datetime import datetime, timezone
 from PIL import Image
@@ -18,12 +23,14 @@ lons = [LON0 + (LON1 - LON0) * i / (N - 1) for i in range(N)]
 lats = [LAT0 + (LAT1 - LAT0) * j / (N - 1) for j in range(N)]
 points = [(lat, lon) for lat in lats for lon in lons]  # j (緯度) が外側
 
-def fetch(base, fields, chunk=100):
+def fetch(base, fields, chunk=100, daily=None):
     out = []
     for k in range(0, len(points), chunk):
         part = points[k:k + chunk]
         url = (base + "?latitude=" + ",".join(f"{p[0]:.2f}" for p in part) +
                "&longitude=" + ",".join(f"{p[1]:.2f}" for p in part) + "&current=" + ",".join(fields))
+        if daily:
+            url += "&daily=" + ",".join(daily) + "&forecast_days=7&timezone=Asia%2FTokyo"
         for attempt in range(4):
             try:
                 with urllib.request.urlopen(url, timeout=60) as r:
@@ -35,12 +42,16 @@ def fetch(base, fields, chunk=100):
                 time.sleep(5)
         if isinstance(data, dict):
             data = [data]
-        out += [d.get("current", {}) for d in data]
+        for d in data:
+            c = dict(d.get("current", {}))
+            c["_daily"] = d.get("daily", {})
+            out.append(c)
         time.sleep(1)
     return out
 
+DAILY = ["weather_code", "temperature_2m_max", "temperature_2m_min", "precipitation_sum", "wind_speed_10m_max"]
 wx = fetch("https://api.open-meteo.com/v1/forecast",
-           ["pressure_msl", "temperature_2m", "cloud_cover", "wind_speed_10m", "wind_direction_10m"])
+           ["pressure_msl", "temperature_2m", "cloud_cover", "wind_speed_10m", "wind_direction_10m", "precipitation"], daily=DAILY)
 sea = fetch("https://marine-api.open-meteo.com/v1/marine",
             ["wave_height", "ocean_current_velocity", "ocean_current_direction"])
 
@@ -57,18 +68,19 @@ def fill_missing(rows, key):
             if vals:
                 r[key] = sum(vals) / len(vals)
 
-for k in ("pressure_msl", "temperature_2m", "cloud_cover", "wind_speed_10m", "wind_direction_10m"):
+for k in ("pressure_msl", "temperature_2m", "cloud_cover", "wind_speed_10m", "wind_direction_10m", "precipitation"):
     fill_missing(wx, k)
 
 def enc(v, lo, hi):
     return max(0, min(255, int(round((v - lo) / (hi - lo) * 255))))
 
-img = Image.new("RGB", (N * 3, N))
+img = Image.new("RGB", (N * 11, N * 2))
 px = img.load()
 stats = {"pressure": [], "temp": []}
 for idx, (w, m) in enumerate(zip(wx, sea)):
     j, i = divmod(idx, N)
-    row = N - 1 - j                            # 画像の上 = 北
+    row = 2 * N - 1 - j                        # 下半分 (画像の上 = 北)
+    top = N - 1 - j                            # 上半分
     p = w.get("pressure_msl") or 1013.0
     t = w.get("temperature_2m")
     t = 15.0 if t is None else t
@@ -84,12 +96,28 @@ for idx, (w, m) in enumerate(zip(wx, sea)):
     px[i, row] = (enc(p, 950, 1050), enc(t, -20, 40), enc(c, 0, 100))
     px[N + i, row] = (enc(wu, -40, 40), enc(wv, -40, 40), enc(wave, 0, 15))
     px[2 * N + i, row] = (enc(cu, -2, 2), enc(cv, -2, 2), 255 if land else 0)
+    pr = w.get("precipitation") or 0.0
+    px[3 * N + i, row] = (enc(math.sqrt(max(pr, 0.0)), 0, math.sqrt(30)), 0, 0)
+    dl = w.get("_daily") or {}
+    for day in range(7):
+        def g(key, default):
+            vals = dl.get(key) or []
+            v = vals[day] if day < len(vals) else None
+            return default if v is None else v
+        tmax, tmin = g("temperature_2m_max", t), g("temperature_2m_min", t)
+        rain = g("precipitation_sum", 0.0)
+        code = int(g("weather_code", 0))
+        wmax = g("wind_speed_10m_max", 0.0) / 3.6
+        x = (4 + day) * N + i
+        px[x, row] = (enc(tmax, -20, 40), enc(tmin, -20, 40), enc(math.sqrt(max(rain, 0.0)), 0, math.sqrt(200)))
+        px[x, top] = (max(0, min(255, code)), enc(wmax, 0, 40), 0)
     stats["pressure"].append(p)
     stats["temp"].append(t)
 
 img.save(os.path.join(OUT, "wx.png"))
 now = datetime.now(timezone.utc)
-meta = {"updated": now.strftime("%Y-%m-%dT%H:%MZ"), "source": "Open-Meteo (CC BY 4.0)",
+days = (wx[0].get("_daily") or {}).get("time") or []
+meta = {"updated": now.strftime("%Y-%m-%dT%H:%MZ"), "source": "Open-Meteo (CC BY 4.0)", "days": days,
         "grid": N, "lon": [LON0, LON1], "lat": [LAT0, LAT1],
         "pressure_min": round(min(stats["pressure"]), 1), "pressure_max": round(max(stats["pressure"]), 1)}
 with open(os.path.join(OUT, "wx.json"), "w", encoding="utf-8") as f:
