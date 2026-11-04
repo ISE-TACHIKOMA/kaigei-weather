@@ -1,8 +1,9 @@
-# 1時間ごとに気象データを取り直して docs/ を更新する (GitHub Pages で公開)
+# 4時間ごと (UTC 0, 4, 8, 12, 16, 20 時) に気象データを取り直して docs/ を更新する (GitHub Pages で公開)
+# Open-Meteo の無料枠 (1日 10,000 回) に収めるため。内訳は fetch_weather.py の先頭に書いた
 name: update weather
 on:
   schedule:
-    - cron: "7 * * * *"
+    - cron: "7 */4 * * *"
   workflow_dispatch:
 permissions:
   contents: write
